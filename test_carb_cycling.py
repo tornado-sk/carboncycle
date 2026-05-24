@@ -5,6 +5,7 @@ Unit tests for CarbCyclingCalculator
 
 import unittest
 from carb_cycling import CarbCyclingCalculator
+from core.input_model import UserInput
 
 
 class TestCalculateBMR(unittest.TestCase):
@@ -145,9 +146,9 @@ class TestCalculateMacros(unittest.TestCase):
         self.body_fat = 20
 
     def test_cutting_reduces_calories(self):
-        """减脂目标减少 500 千卡"""
+        """减脂目标按 TDEE -15% 计算"""
         macros = self.calc.calculate_macros(self.tdee, '减脂', self.body_fat, self.weight)
-        self.assertAlmostEqual(macros['calories'], self.tdee - 500, places=1)
+        self.assertAlmostEqual(macros['calories'], self.tdee * 0.85, places=1)
 
     def test_maintenance_same_calories(self):
         """维持目标卡路里不变"""
@@ -155,9 +156,17 @@ class TestCalculateMacros(unittest.TestCase):
         self.assertAlmostEqual(macros['calories'], self.tdee, places=1)
 
     def test_bulking_increases_calories(self):
-        """增肌目标增加 300 千卡"""
+        """增肌目标按 TDEE +10% 计算"""
         macros = self.calc.calculate_macros(self.tdee, '增肌', self.body_fat, self.weight)
-        self.assertAlmostEqual(macros['calories'], self.tdee + 300, places=1)
+        self.assertAlmostEqual(macros['calories'], self.tdee * 1.10, places=1)
+
+    def test_cutting_floor_at_bmr(self):
+        """减脂下限保护：摄入不低于 BMR"""
+        # 用一个使 0.85 * tdee < bmr 的极端组合
+        bmr = 1500
+        tdee = 1600  # 0.85 * 1600 = 1360 < 1500
+        macros = self.calc.calculate_macros(tdee, '减脂', 20, 70, bmr=bmr)
+        self.assertAlmostEqual(macros['calories'], bmr, places=1)
 
     def test_unknown_goal_defaults_to_maintenance(self):
         """未知目标默认维持（+0）"""
@@ -176,11 +185,15 @@ class TestCalculateMacros(unittest.TestCase):
         macros_30 = self.calc.calculate_macros(self.tdee, '维持', 30, self.weight)
         self.assertGreater(macros_15['protein'], macros_30['protein'])
 
-    def test_fat_is_20_percent_of_calories(self):
-        """脂肪占总卡路里 20%（每克 9 千卡）"""
-        macros = self.calc.calculate_macros(self.tdee, '维持', self.body_fat, self.weight)
-        expected_fat = self.tdee * 0.20 / 9
-        self.assertAlmostEqual(macros['fat'], round(expected_fat, 1), places=1)
+    def test_fat_ratio_by_goal(self):
+        """脂肪占比按目标变化：减脂/维持 25%、增肌 20%"""
+        cut = self.calc.calculate_macros(self.tdee, '减脂', self.body_fat, self.weight)
+        bulk = self.calc.calculate_macros(self.tdee, '增肌', self.body_fat, self.weight)
+        # 减脂占比应高于增肌占比
+        self.assertGreater(cut['fat'] / cut['calories'] * 9, bulk['fat'] / bulk['calories'] * 9)
+        # 维持时脂肪 = 25% / 9 * calories
+        maint = self.calc.calculate_macros(self.tdee, '维持', self.body_fat, self.weight)
+        self.assertAlmostEqual(maint['fat'], round(self.tdee * 0.25 / 9, 1), places=1)
 
     def test_carbs_fill_remaining_calories(self):
         """碳水 = (总卡路里 - 蛋白质卡路里 - 脂肪卡路里) / 4"""
@@ -210,6 +223,18 @@ class TestCalculateMacros(unittest.TestCase):
         macros_bulk = self.calc.calculate_macros(self.tdee, '增肌', self.body_fat, self.weight)
         self.assertGreater(macros_bulk['carbs'], macros_cut['carbs'])
 
+    def test_carbs_clamped_when_protein_dominates(self):
+        """蛋白+脂肪超过目标时碳水钳制为 0 且产生警告"""
+        # 极端低 TDEE + 极低体脂 → 蛋白目标过高
+        macros = self.calc.calculate_macros(tdee=900, goal='减脂', body_fat_pct=5, weight=100)
+        self.assertGreaterEqual(macros['carbs'], 0)
+        self.assertTrue(len(macros['warnings']) > 0)
+
+    def test_no_warnings_for_normal_input(self):
+        """正常参数下不产生警告"""
+        macros = self.calc.calculate_macros(self.tdee, '维持', self.body_fat, self.weight)
+        self.assertEqual(macros['warnings'], [])
+
 
 class TestGetDayType(unittest.TestCase):
     """测试每日碳水类型判定"""
@@ -219,16 +244,16 @@ class TestGetDayType(unittest.TestCase):
         self.days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
 
     def test_4_training_days_default(self):
-        """4天训练：周一(0)、周三(2)、周五(4)、周六(5) 为高碳日"""
+        """4天训练（上下分化）：周一二、周四五为高碳日"""
         high_days = []
         for i in range(7):
             day_type = self.calc.get_day_type(i, training_days=4, days=self.days)
             if day_type == 'high':
                 high_days.append(i)
-        self.assertEqual(high_days, [0, 2, 4, 5])
+        self.assertEqual(high_days, [0, 1, 3, 4])
 
     def test_3_training_days(self):
-        """3天训练：前3天为高碳日"""
+        """3天训练：周一三五为高碳日"""
         high_days = []
         for i in range(7):
             day_type = self.calc.get_day_type(i, training_days=3, days=self.days)
@@ -237,7 +262,7 @@ class TestGetDayType(unittest.TestCase):
         self.assertEqual(high_days, [0, 2, 4])
 
     def test_5_training_days(self):
-        """5天训练应产生 5 个高碳日"""
+        """5天训练：周一二三、周五六为高碳日（共 5 天）"""
         high_days = []
         for i in range(7):
             day_type = self.calc.get_day_type(i, training_days=5, days=self.days)
@@ -246,13 +271,13 @@ class TestGetDayType(unittest.TestCase):
         self.assertEqual(high_days, [0, 1, 2, 4, 5])
 
     def test_6_training_days(self):
-        """6天训练应产生 6 个高碳日"""
+        """6天训练：除周四外均为高碳日（共 6 天）"""
         high_days = []
         for i in range(7):
             day_type = self.calc.get_day_type(i, training_days=6, days=self.days)
             if day_type == 'high':
                 high_days.append(i)
-        self.assertEqual(high_days, [0, 1, 2, 3, 4, 5])
+        self.assertEqual(high_days, [0, 1, 2, 4, 5, 6])
 
     def test_each_day_has_valid_type(self):
         """每天类型必须是 high/moderate/low"""
@@ -261,14 +286,20 @@ class TestGetDayType(unittest.TestCase):
                 day_type = self.calc.get_day_type(i, training_days, self.days)
                 self.assertIn(day_type, ['high', 'moderate', 'low'])
 
-    def test_moderate_day_is_day_after_training(self):
-        """中碳日是训练日的次日"""
-        for i in range(7):
-            day_type = self.calc.get_day_type(i, training_days=4, days=self.days)
-            training_indices = [0, 2, 4, 5]
-            next_day_indices = [(idx + 1) % 7 for idx in training_indices]
-            if i in next_day_indices and i not in training_indices:
-                self.assertEqual(day_type, 'moderate')
+    def test_high_count_matches_training_days(self):
+        """高碳日数量等于训练天数"""
+        for training_days in [3, 4, 5, 6]:
+            high_count = sum(
+                1 for i in range(7)
+                if self.calc.get_day_type(i, training_days, self.days) == 'high'
+            )
+            self.assertEqual(high_count, training_days)
+
+    def test_no_excessive_consecutive_training(self):
+        """5 天训练不应连续 5 天高碳（应至少有一天间断）"""
+        types_5 = [self.calc.get_day_type(i, training_days=5, days=self.days) for i in range(7)]
+        # 周四（index 3）应为 moderate 间断，避免连续 5 天高碳
+        self.assertEqual(types_5[3], 'moderate')
 
 
 class TestCreateWeeklyPlan(unittest.TestCase):
@@ -371,25 +402,25 @@ class TestEndToEnd(unittest.TestCase):
         """男性减脂完整流程"""
         bmr = self.calc.calculate_bmr(weight=80, height=178, age=28, gender='男')
         tdee = self.calc.calculate_tdee(bmr, '中度活跃（每周3-5次运动）', training_years=3)
-        macros = self.calc.calculate_macros(tdee, '减脂', 20, 80)
+        macros = self.calc.calculate_macros(tdee, '减脂', 20, 80, bmr=bmr)
         plan = self.calc.create_weekly_plan(macros, training_days=4)
 
         self.assertGreater(bmr, 0)
         self.assertGreater(tdee, bmr)
         self.assertEqual(len(plan), 7)
-        self.assertAlmostEqual(macros['calories'], tdee - 500, places=1)
+        self.assertAlmostEqual(macros['calories'], tdee * 0.85, places=1)
 
     def test_full_pipeline_female_bulking(self):
         """女性增肌完整流程"""
         bmr = self.calc.calculate_bmr(weight=55, height=163, age=24, gender='女')
         tdee = self.calc.calculate_tdee(bmr, '高度活跃（每周6-7次运动）', training_years=2)
-        macros = self.calc.calculate_macros(tdee, '增肌', 22, 55)
+        macros = self.calc.calculate_macros(tdee, '增肌', 22, 55, bmr=bmr)
         plan = self.calc.create_weekly_plan(macros, training_days=5)
 
         self.assertGreater(bmr, 0)
         self.assertGreater(tdee, bmr)
         self.assertEqual(len(plan), 7)
-        self.assertAlmostEqual(macros['calories'], tdee + 300, places=1)
+        self.assertAlmostEqual(macros['calories'], tdee * 1.10, places=1)
 
     def test_full_pipeline_maintenance(self):
         """维持目标完整流程"""
@@ -404,6 +435,34 @@ class TestEndToEnd(unittest.TestCase):
         for d in plan:
             total_cal = d['protein'] * 4 + d['fat'] * 9 + d['carbs'] * 4
             self.assertAlmostEqual(total_cal, d['calories'], delta=10)
+
+
+class TestUserInput(unittest.TestCase):
+    """测试 UserInput 输入模型"""
+
+    def _valid_input(self, **overrides):
+        defaults = dict(
+            name='张三', gender='男', age=30, height=175, weight=70,
+            body_fat=20, training_years=3, training_intensity='中强度',
+            activity_level='中度活跃（每周3-5次运动）', goal='维持', training_days=4,
+        )
+        defaults.update(overrides)
+        return UserInput(**defaults)
+
+    def test_valid_input_no_errors(self):
+        self.assertEqual(self._valid_input().validate(), [])
+
+    def test_age_out_of_range(self):
+        errors = self._valid_input(age=5).validate()
+        self.assertTrue(any('年龄' in e for e in errors))
+
+    def test_body_fat_out_of_range(self):
+        errors = self._valid_input(body_fat=80).validate()
+        self.assertTrue(any('体脂率' in e for e in errors))
+
+    def test_validate_or_raise(self):
+        with self.assertRaises(ValueError):
+            self._valid_input(weight=10).validate_or_raise()
 
 
 if __name__ == '__main__':
