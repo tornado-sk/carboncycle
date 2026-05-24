@@ -8,10 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QGroupBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QTabWidget, QTextEdit, QMessageBox,
-    QFrame
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 
 
 class CarbCyclingCalculator:
@@ -29,7 +26,7 @@ class CarbCyclingCalculator:
         bmr = (10 * weight) + (6.25 * height) - (5 * age) + gender_factor
         return bmr
 
-    def calculate_tdee(self, bmr, activity_level, training_years):
+    def calculate_tdee(self, bmr, activity_level, training_years, training_intensity='中强度'):
         """计算每日总能量消耗"""
         activity_factors = {
             '久坐（很少运动）': 1.2,
@@ -43,7 +40,14 @@ class CarbCyclingCalculator:
         # 训练年限加成（长期训练者代谢更高效）
         training_bonus = min(0.1, training_years * 0.01)
 
-        tdee = bmr * factor * (1 + training_bonus)
+        intensity_adjustments = {
+            '低强度': -0.03,
+            '中强度': 0,
+            '高强度': 0.04
+        }
+        intensity_adjustment = intensity_adjustments.get(training_intensity, 0)
+
+        tdee = bmr * factor * (1 + training_bonus + intensity_adjustment)
         return tdee
 
     def calculate_macros(self, tdee, goal, body_fat_pct, weight):
@@ -56,8 +60,10 @@ class CarbCyclingCalculator:
         }
         target_calories = tdee + goal_adjustments.get(goal, 0)
 
-        # 蛋白质：基于实际体重计算（1.6-2.2g/kg）
-        protein_g = weight * 2.0
+        # 蛋白质：优先基于瘦体重计算，让体脂率输入影响结果。
+        body_fat_pct = min(max(body_fat_pct, 3), 60)
+        lean_mass = weight * (1 - body_fat_pct / 100)
+        protein_g = lean_mass * 2.2
 
         # 脂肪：占总卡路里的20%（每克脂肪9千卡）
         fat_g = target_calories * 0.20 / 9
@@ -80,23 +86,27 @@ class CarbCyclingCalculator:
         days = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
         plan = []
 
-        # 碳循环模式倍数（仅调整碳水，保持蛋白质和脂肪不变）
-        high_carb_multiplier = 2.0    # 高碳日：2倍
-        moderate_carb_multiplier = 1.0 # 中碳日：1倍
-        low_carb_multiplier = 0.2     # 低碳日：0.2倍
+        carb_weights = {
+            'high': 1.4,
+            'moderate': 1.0,
+            'low': 0.6
+        }
+        day_types = [
+            self.get_day_type(i, training_days, days)
+            for i in range(len(days))
+        ]
+        total_weight = sum(carb_weights[day_type] for day_type in day_types)
+        weekly_base_carbs = base_macros['carbs'] * len(days)
 
-        # 简单模式：高碳日在训练日
-        for i, day in enumerate(days):
-            day_type = self.get_day_type(i, training_days, days)
+        # 只重新分配碳水，保证一周总碳水和目标热量接近 base_macros。
+        for day, day_type in zip(days, day_types):
+            carbs = weekly_base_carbs * carb_weights[day_type] / total_weight
 
             if day_type == 'high':
-                carbs = base_macros['carbs'] * high_carb_multiplier
                 note = "高碳日（训练日）- 补充肌糖原"
             elif day_type == 'moderate':
-                carbs = base_macros['carbs'] * moderate_carb_multiplier
                 note = "中碳日（维持）"
             else:
-                carbs = base_macros['carbs'] * low_carb_multiplier
                 note = "低碳日（燃脂）- 提高脂肪氧化"
 
             total_cal = base_macros['protein'] * 4 + base_macros['fat'] * 9 + carbs * 4
@@ -115,8 +125,13 @@ class CarbCyclingCalculator:
 
     def get_day_type(self, day_index, training_days, days):
         """确定每天的碳水类型"""
-        # 简单模式：周一、周三、周五、周六为训练日（假设4天）
-        training_indices = [0, 2, 4, 5][:training_days]
+        training_patterns = {
+            3: [0, 2, 4],
+            4: [0, 2, 4, 5],
+            5: [0, 1, 2, 4, 5],
+            6: [0, 1, 2, 3, 4, 5]
+        }
+        training_indices = training_patterns.get(training_days, training_patterns[4])
 
         if day_index in training_indices:
             return 'high'
@@ -426,10 +441,16 @@ class MainWindow(QMainWindow):
             goal = self.goal_combo.currentText()
             training_days = int(self.training_days_combo.currentText()[0])
 
+            self._validate_inputs(age, height, weight, body_fat, training_years)
+
             # 计算各项指标
             bmr = self.calculator.calculate_bmr(weight, height, age, gender)
-            tdee = self.calculator.calculate_tdee(bmr, activity_level, training_years)
+            tdee = self.calculator.calculate_tdee(
+                bmr, activity_level, training_years, training_intensity
+            )
             macros = self.calculator.calculate_macros(tdee, goal, body_fat, weight)
+            weekly_plan = self.calculator.create_weekly_plan(macros, training_days)
+            weekly_avg_calories = sum(day['calories'] for day in weekly_plan) / len(weekly_plan)
 
             # 显示基础结果
             result = f"""
@@ -439,6 +460,7 @@ class MainWindow(QMainWindow):
 │  基础代谢率 (BMR): {bmr:.0f} 千卡      │
 │  每日总消耗 (TDEE): {tdee:.0f} 千卡   │
 │  目标摄入: {macros['calories']:.0f} 千卡 │
+│  周计划日均: {weekly_avg_calories:.0f} 千卡 │
 ├─────────────────────────────────────┤
 │  蛋白质: {macros['protein']}g/天      │
 │  脂肪: {macros['fat']}g/天            │
@@ -446,9 +468,6 @@ class MainWindow(QMainWindow):
 └─────────────────────────────────────┘
             """.strip()
             self.result_text.setText(result)
-
-            # 生成周计划
-            weekly_plan = self.calculator.create_weekly_plan(macros, training_days)
 
             # 更新表格
             self.plan_table.setRowCount(len(weekly_plan))
@@ -480,9 +499,10 @@ class MainWindow(QMainWindow):
                 self, '生成成功', f'已为 {name} 生成碳循环饮食计划！'
             )
 
-        except ValueError:
+        except ValueError as e:
+            message = str(e) or '请确保所有数字字段输入正确！'
             QMessageBox.warning(
-                self, '输入错误', '请确保所有数字字段输入正确！'
+                self, '输入错误', message
             )
         except Exception as e:
             QMessageBox.critical(
@@ -493,6 +513,19 @@ class MainWindow(QMainWindow):
         """将十六进制颜色转换为QColor"""
         from PyQt6.QtGui import QColor
         return QColor(hex_color)
+
+    def _validate_inputs(self, age, height, weight, body_fat, training_years):
+        """校验输入范围，防止明显不合理的数据进入计算。"""
+        checks = [
+            (10 <= age <= 100, '年龄应在 10-100 岁之间。'),
+            (100 <= height <= 230, '身高应在 100-230 cm 之间。'),
+            (30 <= weight <= 250, '体重应在 30-250 kg 之间。'),
+            (3 <= body_fat <= 60, '体脂率应在 3%-60% 之间。'),
+            (0 <= training_years <= 80, '训练年限应在 0-80 年之间。')
+        ]
+        for valid, message in checks:
+            if not valid:
+                raise ValueError(message)
 
 
 def main():

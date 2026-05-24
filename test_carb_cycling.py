@@ -95,6 +95,20 @@ class TestCalculateTDEE(unittest.TestCase):
         # min(0.1, 10*0.01)=0.1, min(0.1, 20*0.01)=0.1, 应相同
         self.assertAlmostEqual(tdee_10, tdee_20, places=2)
 
+    def test_training_intensity_adjusts_tdee(self):
+        """训练强度会小幅调整 TDEE"""
+        low = self.calc.calculate_tdee(
+            self.bmr, '中度活跃（每周3-5次运动）', training_years=0, training_intensity='低强度'
+        )
+        medium = self.calc.calculate_tdee(
+            self.bmr, '中度活跃（每周3-5次运动）', training_years=0, training_intensity='中强度'
+        )
+        high = self.calc.calculate_tdee(
+            self.bmr, '中度活跃（每周3-5次运动）', training_years=0, training_intensity='高强度'
+        )
+        self.assertLess(low, medium)
+        self.assertGreater(high, medium)
+
     def test_tdee_greater_than_bmr(self):
         """TDEE 应始终大于 BMR"""
         for level in [
@@ -150,10 +164,17 @@ class TestCalculateMacros(unittest.TestCase):
         macros = self.calc.calculate_macros(self.tdee, '未知', self.body_fat, self.weight)
         self.assertAlmostEqual(macros['calories'], self.tdee, places=1)
 
-    def test_protein_based_on_weight(self):
-        """蛋白质 = 体重 × 2.0"""
+    def test_protein_based_on_lean_mass(self):
+        """蛋白质 = 瘦体重 × 2.2"""
         macros = self.calc.calculate_macros(self.tdee, '维持', self.body_fat, self.weight)
-        self.assertAlmostEqual(macros['protein'], self.weight * 2.0, places=1)
+        lean_mass = self.weight * (1 - self.body_fat / 100)
+        self.assertAlmostEqual(macros['protein'], lean_mass * 2.2, places=1)
+
+    def test_body_fat_changes_protein_target(self):
+        """体脂率越高，同体重下瘦体重和蛋白目标越低"""
+        macros_15 = self.calc.calculate_macros(self.tdee, '维持', 15, self.weight)
+        macros_30 = self.calc.calculate_macros(self.tdee, '维持', 30, self.weight)
+        self.assertGreater(macros_15['protein'], macros_30['protein'])
 
     def test_fat_is_20_percent_of_calories(self):
         """脂肪占总卡路里 20%（每克 9 千卡）"""
@@ -214,6 +235,24 @@ class TestGetDayType(unittest.TestCase):
             if day_type == 'high':
                 high_days.append(i)
         self.assertEqual(high_days, [0, 2, 4])
+
+    def test_5_training_days(self):
+        """5天训练应产生 5 个高碳日"""
+        high_days = []
+        for i in range(7):
+            day_type = self.calc.get_day_type(i, training_days=5, days=self.days)
+            if day_type == 'high':
+                high_days.append(i)
+        self.assertEqual(high_days, [0, 1, 2, 4, 5])
+
+    def test_6_training_days(self):
+        """6天训练应产生 6 个高碳日"""
+        high_days = []
+        for i in range(7):
+            day_type = self.calc.get_day_type(i, training_days=6, days=self.days)
+            if day_type == 'high':
+                high_days.append(i)
+        self.assertEqual(high_days, [0, 1, 2, 3, 4, 5])
 
     def test_each_day_has_valid_type(self):
         """每天类型必须是 high/moderate/low"""
@@ -277,24 +316,26 @@ class TestCreateWeeklyPlan(unittest.TestCase):
     def test_low_carb_day_has_least_carbs(self):
         """低碳日碳水最低"""
         base_macros = {'calories': 2000, 'protein': 140, 'fat': 44.4, 'carbs': 244.4}
-        plan = self.calc.create_weekly_plan(base_macros, training_days=4)
+        plan = self.calc.create_weekly_plan(base_macros, training_days=3)
         low_carbs = [d['carbs'] for d in plan if d['type'] == 'low']
         mod_carbs = [d['carbs'] for d in plan if d['type'] == 'moderate']
         high_carbs = [d['carbs'] for d in plan if d['type'] == 'high']
         self.assertTrue(all(lc < mc for lc in low_carbs for mc in mod_carbs))
         self.assertTrue(all(lc < hc for lc in low_carbs for hc in high_carbs))
 
-    def test_carb_multiplier_values(self):
-        """碳循环倍数：高碳2x，中碳1x，低碳0.2x"""
+    def test_weekly_carbs_match_base_target(self):
+        """周总碳水应接近基础目标，不因循环分配被放大或缩小"""
         base_macros = {'calories': 2000, 'protein': 140, 'fat': 44.4, 'carbs': 200}
         plan = self.calc.create_weekly_plan(base_macros, training_days=4)
-        for d in plan:
-            if d['type'] == 'high':
-                self.assertAlmostEqual(d['carbs'], 200 * 2.0, places=1)
-            elif d['type'] == 'moderate':
-                self.assertAlmostEqual(d['carbs'], 200 * 1.0, places=1)
-            elif d['type'] == 'low':
-                self.assertAlmostEqual(d['carbs'], 200 * 0.2, places=1)
+        total_carbs = sum(day['carbs'] for day in plan)
+        self.assertAlmostEqual(total_carbs, base_macros['carbs'] * 7, delta=1)
+
+    def test_weekly_average_calories_match_base_target(self):
+        """周计划日均热量应接近基础目标热量"""
+        base_macros = {'calories': 2000, 'protein': 140, 'fat': 44.4, 'carbs': 260.1}
+        plan = self.calc.create_weekly_plan(base_macros, training_days=3)
+        average_calories = sum(day['calories'] for day in plan) / len(plan)
+        self.assertAlmostEqual(average_calories, base_macros['calories'], delta=2)
 
     def test_calorie_values_positive(self):
         """每天卡路里应为正值"""
